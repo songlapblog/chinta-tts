@@ -1,0 +1,45 @@
+name: Bengali TTS Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  create-bengali-audio:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install Piper
+        run: |
+          python -m pip install --upgrade pip
+          pip install piper-tts
+
+      - name: Download Bangladesh Bengali voice
+        run: |
+          python -m piper.download_voices bn_BD-google-medium
+
+      - name: Create Bengali test audio
+        run: |
+          cat > sample.txt <<'EOF'
+          চিন্তা মানুষকে মুক্ত করে, সংলাপ মানুষকে সংযুক্ত করে।
+          বাংলাদেশের সমাজ, রাজনীতি ও সংস্কৃতি নিয়ে যুক্তিনির্ভর আলোচনা আমাদের চিন্তাকে সমৃদ্ধ করতে পারে।
+          মতের ভিন্নতা থাকবে, কিন্তু পারস্পরিক শ্রদ্ধা ও সংলাপের পথ সব সময় খোলা থাকা উচিত।
+          EOF
+
+          python -m piper \
+            -m bn_BD-google-medium \
+            -f chinta-bengali-test.wav \
+            --input-file sample.txt
+
+      - name: Save test audio
+        uses: actions/upload-artifact@v6
+        with:
+          name: chinta-bengali-test-audio
+          path: chinta-bengali-test.wav
