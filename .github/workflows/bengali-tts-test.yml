@@ -1,13 +1,19 @@
-name: Bengali TTS 16 Speaker Test V2
+name: Speaker 05 Real Article Test
 
 on:
   workflow_dispatch:
+    inputs:
+      article_url:
+        description: 'WordPress article URL'
+        required: true
+        type: string
+        default: 'https://chintaosonglap.com/%e0%a6%ac%e0%a6%be%e0%a6%9c%e0%a6%be%e0%a6%b0-%e0%a6%b8%e0%a6%bf%e0%a6%a8%e0%a7%8d%e0%a6%a1%e0%a6%bf%e0%a6%95%e0%a7%87%e0%a6%9f-%e0%a6%ad%e0%a6%be%e0%a6%99%e0%a6%a4%e0%a7%87-%e0%a6%b9%e0%a6%b2/'
 
 permissions:
   contents: read
 
 jobs:
-  create-bengali-audio:
+  create-article-audio:
     runs-on: ubuntu-latest
 
     steps:
@@ -16,22 +22,166 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Piper HTTP
+      - name: Install Piper and tools
         run: |
           python -m pip install --upgrade pip
-          pip install "piper-tts[http]"
+          pip install "piper-tts[http]" requests beautifulsoup4
 
       - name: Download Bangladesh Bengali voice
         run: |
           python -m piper.download_voices bn_BD-google-medium
 
-      - name: Create Bengali sample
+      - name: Extract article text
+        env:
+          ARTICLE_URL: ${{ inputs.article_url }}
         run: |
-          cat > sample.txt <<'EOF'
-          চিন্তা মানুষকে মুক্ত করে, সংলাপ মানুষকে সংযুক্ত করে।
-          বাংলাদেশের সমাজ, রাজনীতি ও সংস্কৃতি নিয়ে যুক্তিনির্ভর আলোচনা আমাদের চিন্তাকে সমৃদ্ধ করতে পারে।
-          মতের ভিন্নতা থাকবে, কিন্তু পারস্পরিক শ্রদ্ধা ও সংলাপের পথ সব সময় খোলা থাকা উচিত।
-          EOF
+          cat > extract_article.py <<'PY'
+          import os
+          import re
+          import requests
+          from bs4 import BeautifulSoup
+
+          url = os.environ["ARTICLE_URL"]
+
+          headers = {
+              "User-Agent":
+              "Mozilla/5.0 ChintaOSonglap-Audio/1.0"
+          }
+
+          response = requests.get(
+              url,
+              headers=headers,
+              timeout=60
+          )
+
+          response.raise_for_status()
+
+          soup = BeautifulSoup(
+              response.text,
+              "html.parser"
+          )
+
+          # Article title
+          title_node = (
+              soup.select_one("h1.entry-title")
+              or soup.find("h1")
+          )
+
+          title = (
+              title_node.get_text(" ", strip=True)
+              if title_node else ""
+          )
+
+          # Kadence / WordPress article body
+          content = (
+              soup.select_one("article .entry-content")
+              or soup.select_one(".entry-content")
+          )
+
+          if not content:
+              raise RuntimeError(
+                  "Could not find .entry-content"
+              )
+
+          # Remove things that must never be spoken
+          for bad in content.select(
+              "script, style, noscript, "
+              "button, audio, video, iframe, "
+              "form, nav, svg"
+          ):
+              bad.decompose()
+
+          stop_headings = {
+              "references",
+              "reference",
+              "sources",
+              "source",
+              "সূত্র",
+              "তথ্যসূত্র",
+              "উৎস",
+              "রেফারেন্স",
+          }
+
+          parts = []
+
+          if title:
+              parts.append(title + "।")
+
+          nodes = content.select(
+              "h2, h3, h4, p, li, blockquote"
+          )
+
+          for node in nodes:
+
+              # Avoid duplicate text inside list/quote blocks
+              if (
+                  node.name == "p"
+                  and node.find_parent(
+                      ["li", "blockquote"]
+                  )
+              ):
+                  continue
+
+              text = node.get_text(
+                  " ",
+                  strip=True
+              )
+
+              text = re.sub(
+                  r"\s+",
+                  " ",
+                  text
+              ).strip()
+
+              if not text:
+                  continue
+
+              # Stop before References / Sources section
+              if node.name in {"h2", "h3", "h4"}:
+                  heading = (
+                      text
+                      .strip()
+                      .rstrip(":：")
+                      .lower()
+                  )
+
+                  if heading in stop_headings:
+                      break
+
+              # Do not read raw URLs
+              if re.match(
+                  r"^(https?://|www\.)",
+                  text,
+                  flags=re.I
+              ):
+                  continue
+
+              parts.append(text)
+
+          article_text = "\n".join(parts)
+
+          if len(article_text) < 100:
+              raise RuntimeError(
+                  "Extracted article text is too short"
+              )
+
+          with open(
+              "article-text.txt",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              f.write(article_text)
+
+          print(
+              "Extracted characters:",
+              len(article_text)
+          )
+
+          print("\n--- TEXT PREVIEW ---\n")
+          print(article_text[:1500])
+          PY
+
+          python extract_article.py
 
       - name: Start Piper server
         run: |
@@ -40,74 +190,76 @@ jobs:
             > piper.log 2>&1 &
 
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:5000/info > /dev/null; then
+            if curl -fsS \
+              http://127.0.0.1:5000/info \
+              > /dev/null; then
+
               echo "Piper server ready"
               exit 0
             fi
+
             sleep 1
           done
 
-          echo "Piper server failed to start"
+          echo "Piper failed to start"
           cat piper.log
           exit 1
 
-      - name: Generate all 16 speakers
+      - name: Create full article audio with Speaker 05
         run: |
-          python <<'PY'
-          import json
-          import pathlib
-          import urllib.request
+          cat > make_audio.py <<'PY'
+          import requests
 
-          text = pathlib.Path("sample.txt").read_text(encoding="utf-8")
-          output = pathlib.Path("speaker-tests")
-          output.mkdir(exist_ok=True)
+          with open(
+              "article-text.txt",
+              "r",
+              encoding="utf-8"
+          ) as f:
+              text = f.read()
 
-          for speaker_id in range(16):
+          payload = {
+              "text": text,
+              "speaker_id": 5,
+              "length_scale": 1.0
+          }
 
-              data = json.dumps({
-                  "text": text,
-                  "speaker_id": speaker_id
-              }).encode("utf-8")
+          response = requests.post(
+              "http://127.0.0.1:5000/synthesize",
+              json=payload,
+              timeout=1800
+          )
 
-              request = urllib.request.Request(
-                  "http://127.0.0.1:5000/synthesize",
-                  data=data,
-                  headers={"Content-Type": "application/json"},
-                  method="POST"
-              )
+          response.raise_for_status()
 
-              with urllib.request.urlopen(
-                  request,
-                  timeout=120
-              ) as response:
-                  audio = response.read()
+          with open(
+              "speaker-05-full-article.wav",
+              "wb"
+          ) as f:
+              f.write(response.content)
 
-              filename = output / f"speaker-{speaker_id:02d}.wav"
-              filename.write_bytes(audio)
-
-              print(
-                  f"Created {filename} "
-                  f"({len(audio)} bytes)"
-              )
+          print(
+              "Audio size:",
+              len(response.content),
+              "bytes"
+          )
           PY
 
-      - name: Verify 16 audio files
+          python make_audio.py
+
+      - name: Verify output
         run: |
-          echo "Files generated:"
-          ls -lh speaker-tests/
+          test -s speaker-05-full-article.wav
+          test -s article-text.txt
 
-          COUNT=$(find speaker-tests -type f -name "*.wav" | wc -l)
+          ls -lh \
+            speaker-05-full-article.wav \
+            article-text.txt
 
-          echo "Total WAV files: $COUNT"
-
-          if [ "$COUNT" -ne 16 ]; then
-            echo "ERROR: Expected 16 WAV files."
-            exit 1
-          fi
-
-      - name: Upload all 16 speakers
+      - name: Upload article test
         uses: actions/upload-artifact@v6
         with:
-          name: bengali-16-speakers-v2
-          path: speaker-tests/*.wav
+          name: speaker-05-real-article
+          path: |
+            speaker-05-full-article.wav
+            article-text.txt
           if-no-files-found: error
