@@ -1,4 +1,4 @@
-name: Bengali TTS Test
+name: Bengali TTS 16 Speaker Test
 
 on:
   workflow_dispatch:
@@ -25,7 +25,7 @@ jobs:
         run: |
           python -m piper.download_voices bn_BD-google-medium
 
-      - name: Create Bengali test audio
+      - name: Create Bengali sample
         run: |
           cat > sample.txt <<'EOF'
           চিন্তা মানুষকে মুক্ত করে, সংলাপ মানুষকে সংযুক্ত করে।
@@ -33,13 +33,22 @@ jobs:
           মতের ভিন্নতা থাকবে, কিন্তু পারস্পরিক শ্রদ্ধা ও সংলাপের পথ সব সময় খোলা থাকা উচিত।
           EOF
 
-          python -m piper \
-            -m bn_BD-google-medium \
-            -f chinta-bengali-test.wav \
-            --input-file sample.txt
+      - name: Generate all 16 speakers
+        run: |
+          mkdir -p speaker-tests
 
-      - name: Save test audio
+          for i in $(seq 0 15); do
+            echo "Generating speaker $i"
+
+            python -m piper \
+              -m bn_BD-google-medium \
+              --speaker "$i" \
+              -f "speaker-tests/speaker-$i.wav" \
+              --input-file sample.txt
+          done
+
+      - name: Upload speaker tests
         uses: actions/upload-artifact@v6
         with:
-          name: chinta-bengali-test-audio
-          path: chinta-bengali-test.wav
+          name: bengali-16-speaker-test
+          path: speaker-tests/
