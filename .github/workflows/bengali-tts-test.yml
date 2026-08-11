@@ -1,19 +1,14 @@
-name: Speaker 05 Real Article Test
+name: Chinta Automatic Bengali TTS
 
 on:
-  workflow_dispatch:
-    inputs:
-      article_url:
-        description: 'WordPress article URL'
-        required: true
-        type: string
-        default: 'https://chintaosonglap.com/%e0%a6%ac%e0%a6%be%e0%a6%9c%e0%a6%be%e0%a6%b0-%e0%a6%b8%e0%a6%bf%e0%a6%a8%e0%a7%8d%e0%a6%a1%e0%a6%bf%e0%a6%95%e0%a7%87%e0%a6%9f-%e0%a6%ad%e0%a6%be%e0%a6%99%e0%a6%a4%e0%a7%87-%e0%a6%b9%e0%a6%b2/'
+  repository_dispatch:
+    types: [generate_tts]
 
 permissions:
   contents: read
 
 jobs:
-  create-article-audio:
+  generate-audio:
     runs-on: ubuntu-latest
 
     steps:
@@ -22,166 +17,36 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Piper and tools
+      - name: Install Piper and ffmpeg
         run: |
           python -m pip install --upgrade pip
-          pip install "piper-tts[http]" requests beautifulsoup4
+          pip install "piper-tts[http]" requests
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
 
-      - name: Download Bangladesh Bengali voice
+      - name: Download Bengali voice
         run: |
           python -m piper.download_voices bn_BD-google-medium
 
-      - name: Extract article text
+      - name: Decode article text
         env:
-          ARTICLE_URL: ${{ inputs.article_url }}
+          ARTICLE_DATA: ${{ github.event.client_payload.article_data }}
         run: |
-          cat > extract_article.py <<'PY'
+          python <<'PY'
           import os
-          import re
-          import requests
-          from bs4 import BeautifulSoup
+          import base64
+          import gzip
 
-          url = os.environ["ARTICLE_URL"]
+          encoded = os.environ["ARTICLE_DATA"]
 
-          headers = {
-              "User-Agent":
-              "Mozilla/5.0 ChintaOSonglap-Audio/1.0"
-          }
+          raw = base64.b64decode(encoded)
+          text = gzip.decompress(raw).decode("utf-8")
 
-          response = requests.get(
-              url,
-              headers=headers,
-              timeout=60
-          )
+          with open("article.txt", "w", encoding="utf-8") as f:
+              f.write(text)
 
-          response.raise_for_status()
-
-          soup = BeautifulSoup(
-              response.text,
-              "html.parser"
-          )
-
-          # Article title
-          title_node = (
-              soup.select_one("h1.entry-title")
-              or soup.find("h1")
-          )
-
-          title = (
-              title_node.get_text(" ", strip=True)
-              if title_node else ""
-          )
-
-          # Kadence / WordPress article body
-          content = (
-              soup.select_one("article .entry-content")
-              or soup.select_one(".entry-content")
-          )
-
-          if not content:
-              raise RuntimeError(
-                  "Could not find .entry-content"
-              )
-
-          # Remove things that must never be spoken
-          for bad in content.select(
-              "script, style, noscript, "
-              "button, audio, video, iframe, "
-              "form, nav, svg"
-          ):
-              bad.decompose()
-
-          stop_headings = {
-              "references",
-              "reference",
-              "sources",
-              "source",
-              "সূত্র",
-              "তথ্যসূত্র",
-              "উৎস",
-              "রেফারেন্স",
-          }
-
-          parts = []
-
-          if title:
-              parts.append(title + "।")
-
-          nodes = content.select(
-              "h2, h3, h4, p, li, blockquote"
-          )
-
-          for node in nodes:
-
-              # Avoid duplicate text inside list/quote blocks
-              if (
-                  node.name == "p"
-                  and node.find_parent(
-                      ["li", "blockquote"]
-                  )
-              ):
-                  continue
-
-              text = node.get_text(
-                  " ",
-                  strip=True
-              )
-
-              text = re.sub(
-                  r"\s+",
-                  " ",
-                  text
-              ).strip()
-
-              if not text:
-                  continue
-
-              # Stop before References / Sources section
-              if node.name in {"h2", "h3", "h4"}:
-                  heading = (
-                      text
-                      .strip()
-                      .rstrip(":：")
-                      .lower()
-                  )
-
-                  if heading in stop_headings:
-                      break
-
-              # Do not read raw URLs
-              if re.match(
-                  r"^(https?://|www\.)",
-                  text,
-                  flags=re.I
-              ):
-                  continue
-
-              parts.append(text)
-
-          article_text = "\n".join(parts)
-
-          if len(article_text) < 100:
-              raise RuntimeError(
-                  "Extracted article text is too short"
-              )
-
-          with open(
-              "article-text.txt",
-              "w",
-              encoding="utf-8"
-          ) as f:
-              f.write(article_text)
-
-          print(
-              "Extracted characters:",
-              len(article_text)
-          )
-
-          print("\n--- TEXT PREVIEW ---\n")
-          print(article_text[:1500])
+          print("Article characters:", len(text))
           PY
-
-          python extract_article.py
 
       - name: Start Piper server
         run: |
@@ -190,76 +55,107 @@ jobs:
             > piper.log 2>&1 &
 
           for i in $(seq 1 30); do
-            if curl -fsS \
-              http://127.0.0.1:5000/info \
-              > /dev/null; then
-
-              echo "Piper server ready"
+            if curl -fsS http://127.0.0.1:5000/info > /dev/null; then
+              echo "Piper ready"
               exit 0
             fi
-
             sleep 1
           done
 
-          echo "Piper failed to start"
           cat piper.log
           exit 1
 
-      - name: Create full article audio with Speaker 05
+      - name: Generate Speaker 05 audio
         run: |
-          cat > make_audio.py <<'PY'
+          python <<'PY'
+          import pathlib
+          import re
           import requests
 
-          with open(
-              "article-text.txt",
-              "r",
-              encoding="utf-8"
-          ) as f:
-              text = f.read()
+          text = pathlib.Path("article.txt").read_text(encoding="utf-8")
 
-          payload = {
-              "text": text,
-              "speaker_id": 5,
-              "length_scale": 1.0
-          }
-
-          response = requests.post(
-              "http://127.0.0.1:5000/synthesize",
-              json=payload,
-              timeout=1800
+          sentences = re.split(
+              r'(?<=[।!?])\s+|\n+',
+              text
           )
 
-          response.raise_for_status()
+          chunks = []
+          current = ""
 
-          with open(
-              "speaker-05-full-article.wav",
-              "wb"
-          ) as f:
-              f.write(response.content)
+          for sentence in sentences:
+              sentence = sentence.strip()
 
-          print(
-              "Audio size:",
-              len(response.content),
-              "bytes"
-          )
+              if not sentence:
+                  continue
+
+              if len(current) + len(sentence) + 1 <= 900:
+                  current = (
+                      current + " " + sentence
+                  ).strip()
+              else:
+                  if current:
+                      chunks.append(current)
+
+                  while len(sentence) > 900:
+                      cut = sentence.rfind(" ", 0, 900)
+
+                      if cut < 300:
+                          cut = 900
+
+                      chunks.append(sentence[:cut].strip())
+                      sentence = sentence[cut:].strip()
+
+                  current = sentence
+
+          if current:
+              chunks.append(current)
+
+          print("Audio chunks:", len(chunks))
+
+          output = pathlib.Path("chunks")
+          output.mkdir(exist_ok=True)
+
+          for number, chunk in enumerate(chunks, 1):
+
+              response = requests.post(
+                  "http://127.0.0.1:5000/synthesize",
+                  json={
+                      "text": chunk,
+                      "speaker_id": 5
+                  },
+                  timeout=300
+              )
+
+              response.raise_for_status()
+
+              filename = output / f"part-{number:04d}.wav"
+              filename.write_bytes(response.content)
+
+              print("Created", filename)
           PY
 
-          python make_audio.py
-
-      - name: Verify output
+      - name: Combine and create MP3
         run: |
-          test -s speaker-05-full-article.wav
-          test -s article-text.txt
+          rm -f concat.txt
 
-          ls -lh \
-            speaker-05-full-article.wav \
-            article-text.txt
+          for f in chunks/*.wav; do
+            echo "file '$PWD/$f'" >> concat.txt
+          done
 
-      - name: Upload article test
+          ffmpeg -y \
+            -f concat \
+            -safe 0 \
+            -i concat.txt \
+            -c:a libmp3lame \
+            -b:a 64k \
+            chinta-article.mp3
+
+          ls -lh chinta-article.mp3
+
+      - name: Upload finished audio
         uses: actions/upload-artifact@v6
         with:
-          name: speaker-05-real-article
-          path: |
-            speaker-05-full-article.wav
-            article-text.txt
+          name: chinta-tts-${{ github.event.client_payload.job_key }}
+          path: chinta-article.mp3
           if-no-files-found: error
+          retention-days: 1
