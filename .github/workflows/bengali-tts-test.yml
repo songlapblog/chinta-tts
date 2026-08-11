@@ -5,13 +5,20 @@ on:
     types: [generate_tts]
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: chinta-tts-main-audio
+  cancel-in-progress: false
 
 jobs:
   generate-audio:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
@@ -21,8 +28,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install "piper-tts[http]" requests
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
 
       - name: Download Bengali voice
         run: |
@@ -31,19 +41,27 @@ jobs:
       - name: Decode article text
         env:
           ARTICLE_DATA: ${{ github.event.client_payload.article_data }}
+          POST_ID: ${{ github.event.client_payload.post_id }}
         run: |
+          if ! [[ "$POST_ID" =~ ^[0-9]+$ ]]; then
+            echo "Invalid post ID"
+            exit 1
+          fi
+
           python <<'PY'
           import os
           import base64
           import gzip
+          import pathlib
 
           encoded = os.environ["ARTICLE_DATA"]
-
           raw = base64.b64decode(encoded)
           text = gzip.decompress(raw).decode("utf-8")
 
-          with open("article.txt", "w", encoding="utf-8") as f:
-              f.write(text)
+          pathlib.Path("article.txt").write_text(
+              text,
+              encoding="utf-8"
+          )
 
           print("Article characters:", len(text))
           PY
@@ -55,7 +73,9 @@ jobs:
             > piper.log 2>&1 &
 
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:5000/info > /dev/null; then
+            if curl -fsS \
+              http://127.0.0.1:5000/info \
+              >/dev/null; then
               echo "Piper ready"
               exit 0
             fi
@@ -72,7 +92,11 @@ jobs:
           import re
           import requests
 
-          text = pathlib.Path("article.txt").read_text(encoding="utf-8")
+          text = pathlib.Path(
+              "article.txt"
+          ).read_text(
+              encoding="utf-8"
+          )
 
           sentences = re.split(
               r'(?<=[।!?])\s+|\n+',
@@ -97,26 +121,40 @@ jobs:
                       chunks.append(current)
 
                   while len(sentence) > 900:
-                      cut = sentence.rfind(" ", 0, 900)
+                      cut = sentence.rfind(
+                          " ",
+                          0,
+                          900
+                      )
 
                       if cut < 300:
                           cut = 900
 
-                      chunks.append(sentence[:cut].strip())
-                      sentence = sentence[cut:].strip()
+                      chunks.append(
+                          sentence[:cut].strip()
+                      )
+
+                      sentence = (
+                          sentence[cut:].strip()
+                      )
 
                   current = sentence
 
           if current:
               chunks.append(current)
 
-          print("Audio chunks:", len(chunks))
+          if not chunks:
+              raise RuntimeError(
+                  "No article text to synthesize"
+              )
 
           output = pathlib.Path("chunks")
           output.mkdir(exist_ok=True)
 
-          for number, chunk in enumerate(chunks, 1):
-
+          for number, chunk in enumerate(
+              chunks,
+              1
+          ):
               response = requests.post(
                   "http://127.0.0.1:5000/synthesize",
                   json={
@@ -128,13 +166,21 @@ jobs:
 
               response.raise_for_status()
 
-              filename = output / f"part-{number:04d}.wav"
-              filename.write_bytes(response.content)
+              filename = (
+                  output /
+                  f"part-{number:04d}.wav"
+              )
+
+              filename.write_bytes(
+                  response.content
+              )
 
               print("Created", filename)
+
+          print("Total chunks:", len(chunks))
           PY
 
-      - name: Combine and create MP3
+      - name: Combine audio into MP3
         run: |
           rm -f concat.txt
 
@@ -150,12 +196,32 @@ jobs:
             -b:a 64k \
             chinta-article.mp3
 
+          test -s chinta-article.mp3
           ls -lh chinta-article.mp3
 
-      - name: Upload finished audio
-        uses: actions/upload-artifact@v6
-        with:
-          name: chinta-tts-${{ github.event.client_payload.job_key }}
-          path: chinta-article.mp3
-          if-no-files-found: error
-          retention-days: 1
+      - name: Save MP3 to repository
+        env:
+          POST_ID: ${{ github.event.client_payload.post_id }}
+        run: |
+          mkdir -p audio
+
+          cp chinta-article.mp3 \
+            "audio/post-${POST_ID}.mp3"
+
+          git config user.name \
+            "github-actions[bot]"
+
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            "audio/post-${POST_ID}.mp3"
+
+          if git diff --cached --quiet; then
+            echo "Audio file is unchanged"
+          else
+            git commit -m \
+              "Update TTS audio for post ${POST_ID}"
+
+            git push
+          fi
