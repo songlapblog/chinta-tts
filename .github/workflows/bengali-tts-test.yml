@@ -1,4 +1,4 @@
-name: Bengali TTS 16 Speaker Test
+name: Bengali TTS 16 Speaker Test V2
 
 on:
   workflow_dispatch:
@@ -16,10 +16,10 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Piper
+      - name: Install Piper HTTP
         run: |
           python -m pip install --upgrade pip
-          pip install piper-tts
+          pip install "piper-tts[http]"
 
       - name: Download Bangladesh Bengali voice
         run: |
@@ -33,22 +33,81 @@ jobs:
           মতের ভিন্নতা থাকবে, কিন্তু পারস্পরিক শ্রদ্ধা ও সংলাপের পথ সব সময় খোলা থাকা উচিত।
           EOF
 
-      - name: Generate all 16 speakers
+      - name: Start Piper server
         run: |
-          mkdir -p speaker-tests
+          nohup python -m piper.http_server \
+            -m bn_BD-google-medium \
+            > piper.log 2>&1 &
 
-          for i in $(seq 0 15); do
-            echo "Generating speaker $i"
-
-            python -m piper \
-              -m bn_BD-google-medium \
-              --speaker "$i" \
-              -f "speaker-tests/speaker-$i.wav" \
-              --input-file sample.txt
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:5000/info > /dev/null; then
+              echo "Piper server ready"
+              exit 0
+            fi
+            sleep 1
           done
 
-      - name: Upload speaker tests
+          echo "Piper server failed to start"
+          cat piper.log
+          exit 1
+
+      - name: Generate all 16 speakers
+        run: |
+          python <<'PY'
+          import json
+          import pathlib
+          import urllib.request
+
+          text = pathlib.Path("sample.txt").read_text(encoding="utf-8")
+          output = pathlib.Path("speaker-tests")
+          output.mkdir(exist_ok=True)
+
+          for speaker_id in range(16):
+
+              data = json.dumps({
+                  "text": text,
+                  "speaker_id": speaker_id
+              }).encode("utf-8")
+
+              request = urllib.request.Request(
+                  "http://127.0.0.1:5000/synthesize",
+                  data=data,
+                  headers={"Content-Type": "application/json"},
+                  method="POST"
+              )
+
+              with urllib.request.urlopen(
+                  request,
+                  timeout=120
+              ) as response:
+                  audio = response.read()
+
+              filename = output / f"speaker-{speaker_id:02d}.wav"
+              filename.write_bytes(audio)
+
+              print(
+                  f"Created {filename} "
+                  f"({len(audio)} bytes)"
+              )
+          PY
+
+      - name: Verify 16 audio files
+        run: |
+          echo "Files generated:"
+          ls -lh speaker-tests/
+
+          COUNT=$(find speaker-tests -type f -name "*.wav" | wc -l)
+
+          echo "Total WAV files: $COUNT"
+
+          if [ "$COUNT" -ne 16 ]; then
+            echo "ERROR: Expected 16 WAV files."
+            exit 1
+          fi
+
+      - name: Upload all 16 speakers
         uses: actions/upload-artifact@v6
         with:
-          name: bengali-16-speaker-test
-          path: speaker-tests/
+          name: bengali-16-speakers-v2
+          path: speaker-tests/*.wav
+          if-no-files-found: error
