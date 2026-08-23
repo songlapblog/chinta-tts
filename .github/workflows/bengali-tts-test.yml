@@ -1,4 +1,4 @@
-name: Chinta Automatic Bengali TTS
+name: Chinta Automatic Multilingual TTS
 
 on:
   repository_dispatch:
@@ -34,9 +34,11 @@ jobs:
             sudo apt-get install -y ffmpeg
           fi
 
-      - name: Download Bengali voice
+      - name: Download Bengali, English, and Arabic voices
         run: |
           python -m piper.download_voices bn_BD-google-medium
+          python -m piper.download_voices en_US-lessac-medium
+          python -m piper.download_voices ar_JO-kareem-medium
 
       - name: Decode article text
         env:
@@ -66,10 +68,11 @@ jobs:
           print("Article characters:", len(text))
           PY
 
-      - name: Start Piper server
+      - name: Start multilingual Piper server
         run: |
           nohup python -m piper.http_server \
             -m bn_BD-google-medium \
+            --data-dir . \
             > piper.log 2>&1 &
 
           for i in $(seq 1 30); do
@@ -77,6 +80,7 @@ jobs:
               http://127.0.0.1:5000/info \
               >/dev/null; then
               echo "Piper ready"
+              curl -fsS http://127.0.0.1:5000/voices || true
               exit 0
             fi
             sleep 1
@@ -85,65 +89,141 @@ jobs:
           cat piper.log
           exit 1
 
-      - name: Generate Speaker 05 audio
+      - name: Generate multilingual audio segments
         run: |
           python <<'PY'
           import pathlib
           import re
           import requests
 
-          text = pathlib.Path(
-              "article.txt"
-          ).read_text(
+          VOICES = {
+              "bn": "bn_BD-google-medium",
+              "en": "en_US-lessac-medium",
+              "ar": "ar_JO-kareem-medium",
+          }
+
+          MAX_CHARS = 900
+
+          text = pathlib.Path("article.txt").read_text(
               encoding="utf-8"
           )
 
-          sentences = re.split(
-              r'(?<=[।!?])\s+|\n+',
-              text
-          )
+          def strong_language(char):
+              code = ord(char)
 
-          chunks = []
-          current = ""
+              if 0x0980 <= code <= 0x09FF:
+                  return "bn"
 
-          for sentence in sentences:
-              sentence = sentence.strip()
+              if (
+                  0x0600 <= code <= 0x06FF
+                  or 0x0750 <= code <= 0x077F
+                  or 0x08A0 <= code <= 0x08FF
+                  or 0xFB50 <= code <= 0xFDFF
+                  or 0xFE70 <= code <= 0xFEFF
+              ):
+                  return "ar"
 
-              if not sentence:
+              if (
+                  "A" <= char <= "Z"
+                  or "a" <= char <= "z"
+              ):
+                  return "en"
+
+              return None
+
+          counts = {"bn": 0, "en": 0, "ar": 0}
+
+          for char in text:
+              language = strong_language(char)
+              if language:
+                  counts[language] += 1
+
+          default_language = max(counts, key=counts.get)
+
+          if counts[default_language] == 0:
+              raise RuntimeError(
+                  "No Bengali, English, or Arabic text found"
+              )
+
+          runs = []
+          current_language = default_language
+          current_text = ""
+
+          for char in text:
+              language = strong_language(char)
+
+              if language and language != current_language:
+                  if current_text.strip():
+                      runs.append(
+                          (current_language, current_text.strip())
+                      )
+
+                  current_language = language
+                  current_text = char
+              else:
+                  current_text += char
+
+          if current_text.strip():
+              runs.append(
+                  (current_language, current_text.strip())
+              )
+
+          merged_runs = []
+
+          for language, run_text in runs:
+              run_text = re.sub(r"\s+", " ", run_text).strip()
+
+              if not run_text:
                   continue
 
-              if len(current) + len(sentence) + 1 <= 900:
-                  current = (
-                      current + " " + sentence
-                  ).strip()
+              if merged_runs and merged_runs[-1][0] == language:
+                  previous_language, previous_text = merged_runs[-1]
+                  merged_runs[-1] = (
+                      previous_language,
+                      f"{previous_text} {run_text}".strip()
+                  )
               else:
-                  if current:
-                      chunks.append(current)
+                  merged_runs.append((language, run_text))
 
-                  while len(sentence) > 900:
-                      cut = sentence.rfind(
-                          " ",
-                          0,
-                          900
-                      )
+          def split_text(value, limit=MAX_CHARS):
+              pieces = []
+              remaining = value.strip()
 
-                      if cut < 300:
-                          cut = 900
+              while len(remaining) > limit:
+                  window = remaining[:limit + 1]
 
-                      chunks.append(
-                          sentence[:cut].strip()
-                      )
+                  possible_cuts = [
+                      window.rfind("।"),
+                      window.rfind("."),
+                      window.rfind("!"),
+                      window.rfind("?"),
+                      window.rfind("؟"),
+                      window.rfind(" "),
+                  ]
 
-                      sentence = (
-                          sentence[cut:].strip()
-                      )
+                  cut = max(possible_cuts)
 
-                  current = sentence
+                  if cut < 300:
+                      cut = limit
+                  else:
+                      cut += 1
 
-          if current:
-              chunks.append(current)
+                  pieces.append(remaining[:cut].strip())
+                  remaining = remaining[cut:].strip()
 
-          if not chunks:
+              if remaining:
+                  pieces.append(remaining)
+
+              return pieces
+
+          segments = []
+
+          for language, run_text in merged_runs:
+              for piece in split_text(run_text):
+                  if piece:
+                      segments.append((language, piece))
+
+          if not segments:
               raise RuntimeError(
                   "No article text to synthesize"
               )
@@ -151,43 +231,59 @@ jobs:
           output = pathlib.Path("chunks")
           output.mkdir(exist_ok=True)
 
-          for number, chunk in enumerate(
-              chunks,
+          manifest_lines = []
+
+          for number, (language, segment_text) in enumerate(
+              segments,
               1
           ):
+              payload = {
+                  "text": segment_text,
+                  "voice": VOICES[language],
+              }
+
+              if language == "bn":
+                  payload["speaker_id"] = 5
+
               response = requests.post(
                   "http://127.0.0.1:5000/synthesize",
-                  json={
-                      "text": chunk,
-                      "speaker_id": 5
-                  },
+                  json=payload,
                   timeout=300
               )
 
               response.raise_for_status()
 
-              filename = (
-                  output /
-                  f"part-{number:04d}.wav"
+              filename = output / (
+                  f"part-{number:04d}-{language}.wav"
               )
 
-              filename.write_bytes(
-                  response.content
+              filename.write_bytes(response.content)
+
+              manifest_lines.append(
+                  f"file '{filename.resolve()}'"
               )
 
-              print("Created", filename)
+              print(
+                  "Created",
+                  filename,
+                  "voice=",
+                  VOICES[language],
+                  "characters=",
+                  len(segment_text)
+              )
 
-          print("Total chunks:", len(chunks))
+          pathlib.Path("concat.txt").write_text(
+              "\n".join(manifest_lines) + "\n",
+              encoding="utf-8"
+          )
+
+          print("Language counts:", counts)
+          print("Default language:", default_language)
+          print("Total audio segments:", len(segments))
           PY
 
       - name: Combine audio into MP3
         run: |
-          rm -f concat.txt
-
-          for f in chunks/*.wav; do
-            echo "file '$PWD/$f'" >> concat.txt
-          done
-
           ffmpeg -y \
             -f concat \
             -safe 0 \
@@ -221,7 +317,7 @@ jobs:
             echo "Audio file is unchanged"
           else
             git commit -m \
-              "Update TTS audio for post ${POST_ID}"
+              "Update multilingual TTS audio for post ${POST_ID}"
 
             git push
           fi
